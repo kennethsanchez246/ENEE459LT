@@ -11,6 +11,7 @@ from graph import (
     unknown,
 )
 
+import math 
 
 FLOPS_PER_MAC = 2
 
@@ -44,9 +45,39 @@ TIE_EXACT = True
 # ===========================================================================
 # 1. How many numbers are stored
 # ===========================================================================
+def _layer_parameters(ly: Layer) -> int:
+  if ly.kind == "conv":
+    Cout = ly.out_shape[0] 
+    Cin = ly.in_shape[0]
+    kH, kW = ly.kernel
+    nweights = Cout * (Cin//ly.groups) * kH * kW
+    nbias = Cout if ly.bias else 0
+    return nweights + nbias
+  elif ly.kind == "linear":
+    fout = ly.out_shape[0]
+    fin = ly.in_shape[0]
+    nweights = fout * fin
+    nbias = fout if ly.bias else 0
+    return nweights + nbias
+  elif ly.kind == "bn":
+    return BN_PARAMS_PER_CHANNEL * ly.out_shape[0]
+  else:
+    return 0
+
 
 def count_parameters(graph: Graph) -> dict[str, Any]:
-    pass
+  per_layer = {}
+  for ly in graph.layers:
+    per_layer[ly.name] = _layer_parameters(ly)
+  total = sum(per_layer.values())
+  return computed(
+      total,
+      "Computed from layer shapes and configuration; includes biases and excludes batch-normalisation buffers.",
+      per_layer=per_layer,
+      includes_bias=True,
+      excludes_bn_buffers=True,
+      bn_params_per_channel=BN_PARAMS_PER_CHANNEL,
+  )
 
 
 # ===========================================================================
@@ -76,11 +107,71 @@ def model_size_bytes(graph: Graph) -> dict[str, Any]:
     Returns a `computed` finding whose value is bytes, with the per-dtype
     breakdown that makes the first bullet checkable.
     """
-    pass
+    per_dtype: dict[str, float] = {}
+    per_layer: dict[str, float] = {}
+    buffer_bytes = 0.0
+    for ly in graph.layers:
+      parameter_bytes = _layer_parameters(ly) * dtype_bytes(ly.weight_dtype)
+      layer_bytes = parameter_bytes
+      per_dtype[ly.weight_dtype] = (
+        per_dtype.get(ly.weight_dtype, 0.0) + parameter_bytes
+      )
+
+      if ly.kind == "bn":
+        buffer_elements = BN_BUFFERS_PER_CHANNEL * ly.out_shape[0]
+        layer_buffer_bytes = buffer_elements * dtype_bytes(BUFFER_DTYPE)
+        buffer_bytes += layer_buffer_bytes
+        per_dtype[BUFFER_DTYPE] = (
+          per_dtype.get(BUFFER_DTYPE, 0.0) + layer_buffer_bytes
+        )
+        layer_bytes += layer_buffer_bytes
+
+      per_layer[ly.name] = layer_bytes
+
+    total = sum(per_layer.values())
+    return computed(
+      total,
+      "Computed from layer parameters and persistent batch-normalisation buffers; container overhead excluded.",
+      per_layer=per_layer,
+      per_dtype=per_dtype,
+      buffer_bytes=buffer_bytes,
+      container_overhead_excluded=True,
+    )
 
 # ===========================================================================
 # 3. The memory nobody puts in the table
 # ===========================================================================
+def _elements(shape: tuple[int, ...]) -> int:
+  return math.prod(shape)
+
+def _last_use(graph: Graph) -> dict[str, int]:
+  last: dict[str, int] = {}
+  for i, ly in enumerate(graph.layers):
+    for t in ly.reads:
+      last[t] = i
+    if i == 0 and not ly.reads:
+      last["__input__"] = i
+    if i > 0 and not ly.reads:
+      last[graph.layers[i-1].name] = i
+
+    last.setdefault(ly.name, i)
+
+  if graph.layers:
+    last[graph.layers[-1].name] = len(graph) - 1
+
+  return last
+
+def _peak_elements(graph: Graph, last_use: dict[str, int]) -> int:
+  live = {"__input__": _elements(graph.input_shape)}
+  peak = sum(live.values())
+  for i, ly in enumerate(graph.layers):
+    live[ly.name] = ly.out_elements
+    peak = max(peak, sum(live.values()))
+    for tensor, last_index in last_use.items():
+      if last_index == i:
+        live.pop(tensor, None)
+
+  return peak
 
 def count_activations(graph: Graph) -> dict[str, Any]:
     """Total and peak activation footprint, in elements and in bytes.
@@ -111,7 +202,40 @@ def count_activations(graph: Graph) -> dict[str, Any]:
     what a memory budget is denominated in, with elements and the layer where
     the peak occurs alongside.
     """
-    pass
+    last_use = _last_use(graph)
+    live: dict[str, float] = {
+        "__input__": _elements(graph.input_shape) * dtype_bytes(graph.precision)
+    }
+    total_elements = 0
+    total_bytes = 0.0
+    peak_bytes = 0.0
+    peak_at = None
+
+    for i, ly in enumerate(graph.layers):
+      output_elements = ly.out_elements
+      output_bytes = output_elements * dtype_bytes(ly.act_dtype)
+      live[ly.name] = output_bytes
+      total_elements += output_elements
+      total_bytes += output_bytes
+
+      resident = sum(live.values())
+      if resident > peak_bytes:
+        peak_bytes = resident
+        peak_at = ly.name
+
+      for tensor, last_index in last_use.items():
+        if last_index == i:
+          live.pop(tensor, None)
+
+    return computed(
+        peak_bytes,
+        f"{graph.name}: liveness over {len(graph)} layers, input included",
+        peak_at=peak_at,
+        peak_elements=_peak_elements(graph, last_use),
+        total_elements=total_elements,
+        total_bytes=total_bytes,
+        includes_network_input=True,
+    )
 
 # ===========================================================================
 # 4. The factor of two that halves everybody's numbers
@@ -139,4 +263,27 @@ def to_flops(macs: dict[str, Any], convention: str = "mac_is_two_flops") -> dict
     An unrecognised convention is `unknown`, not a default. The caller asked
     for something this function does not know how to do.
     """
-    pass
+    if not is_answered(macs):
+      return unknown("to_flops", "No valid MAC count was provided.")
+
+    if convention not in FLOP_CONVENTIONS:
+      allowed = ", ".join(sorted(FLOP_CONVENTIONS))
+      return unknown(
+          "to_flops",
+          f"Unrecognized convention {convention!r}; allowed options: {allowed}.",
+      )
+
+    factor = FLOP_CONVENTIONS[convention]
+    per_layer_macs = macs.get("per_layer")
+    per_layer = (
+        {name: count * factor for name, count in per_layer_macs.items()}
+        if isinstance(per_layer_macs, dict)
+        else None
+    )
+    return computed(
+        macs["value"] * factor,
+        macs["source"],
+        convention=convention,
+        flops_per_mac=factor,
+        per_layer=per_layer,
+    )
