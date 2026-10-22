@@ -118,40 +118,231 @@ def quantize_tensor(t: Tensor, bits: int = DEFAULT_BITS,
                     clip: str = "minmax",
                     percentile: float = DEFAULT_PERCENTILE,
                     given_range: tuple[float, float] | None = None) -> Quantized:
-    pass
+    if granularity not in GRANULARITIES:
+        raise TensorError
+    if clip not in CLIP_METHODS:
+        raise TensorError
+
+    qmin, qmax = _qmin_qmax(bits, symmetric)
+    groups = (
+        [_channel_slice(t, channel) for channel in range(t.channels)]
+        if granularity == "per_channel"
+        else [(0, len(t.data))]
+    )
+    codes = [0] * len(t.data)
+    scales: list[float] = []
+    zeros: list[int] = []
+    clipped = 0
+
+    for lo, hi in groups:
+        if given_range is not None:
+            rlo, rhi = float(given_range[0]), float(given_range[1])
+        else:
+            rlo, rhi = _range_of(t.data[lo:hi], clip, percentile, bits)
+        scale, zero = _scale_zero(rlo, rhi, bits, symmetric)
+        scales.append(scale)
+        zeros.append(zero)
+
+        for index in range(lo, hi):
+            code = _round_half_up(t.data[index] / scale) + zero
+            if code < qmin or code > qmax:
+                clipped += 1
+            codes[index] = max(qmin, min(qmax, code))
+
+    return Quantized(
+        name=t.name,
+        shape=tuple(t.shape),
+        codes=tuple(codes),
+        scales=tuple(scales),
+        zeros=tuple(zeros),
+        bits=int(bits),
+        granularity=granularity,
+        symmetric=bool(symmetric),
+        clipped=clipped,
+    )
 
 
 def dequantize(qt: Quantized) -> Tensor:
-    pass
+    stride = qt.channel_stride if qt.granularity == "per_channel" else len(qt.codes)
+    if stride <= 0:
+        raise TensorError
+
+    out = []
+    for index, code in enumerate(qt.codes):
+        group = index // stride
+        if group >= len(qt.scales):
+            raise TensorError
+        out.append(round(qt.scales[group] * (int(code) - qt.zeros[group]), 8))
+
+    return Tensor(name=qt.name, shape=qt.shape, data=tuple(out), dtype="fp32")
 
 
 
 def quantization_error(before: Sequence[Tensor],
                        after: Sequence[Tensor]) -> dict[str, float]:
-    pass
+    original_tensors = list(before)
+    reconstructed_tensors = list(after)
+    if len(original_tensors) != len(reconstructed_tensors):
+        raise TensorError
+
+    numerator = 0.0
+    denominator = 0.0
+    worst = 0.0
+    for original, reconstructed in zip(original_tensors, reconstructed_tensors):
+        if len(original.data) != len(reconstructed.data):
+            raise TensorError
+        for source, result in zip(original.data, reconstructed.data):
+            difference = source - result
+            numerator += difference * difference
+            denominator += source * source
+            worst = max(worst, abs(difference))
+
+    frobenius = math.sqrt(numerator)
+    return {
+        "frobenius": round(frobenius, 8),
+        "relative": round(frobenius / math.sqrt(denominator), 8)
+        if denominator > 0.0 else 0.0,
+        "max_abs": round(worst, 8),
+    }
 
 
 
 def bytes_stored(tensors: Sequence[Tensor], precision: str = "fp32",
                  granularity: str = "per_tensor") -> int:
-    pass
+    if precision not in PRECISIONS:
+        raise TensorError
+    if granularity not in GRANULARITIES:
+        raise TensorError
+
+    bytes_per_element = dtype_bytes(precision)
+    total = 0.0
+    for tensor in tensors:
+        total += tensor.parameters * bytes_per_element
+        if precision == "int8":
+            groups = tensor.channels if granularity == "per_channel" else 1
+            total += groups * (SCALE_BYTES + ZERO_BYTES)
+    return int(total)
 
 
 def effective_bits(tensors: Sequence[Tensor], precision: str = "fp32",
                    granularity: str = "per_tensor") -> float:
-    pass
+    parameter_count = total_parameters(tensors)
+    if parameter_count <= 0:
+        raise TensorError
+    return round(bytes_stored(tensors, precision, granularity) * 8.0 / parameter_count, 4)
 
 
 def precision_row(model_name: str, config: Mapping[str, Any],
                   tensors: Sequence[Tensor],
                   calibration_values: Sequence[float],
                   all_values: Sequence[float]) -> dict[str, Any]:
-    pass
+    label = config.get("label")
+    if not label or not str(label).strip():
+        raise TensorError
+
+    precision = config.get("precision", "fp32")
+    granularity = config.get("granularity", "per_tensor")
+    symmetric = bool(config.get("symmetric", True))
+    clip = config.get("clip", "minmax")
+    percentile = float(config.get("percentile", DEFAULT_PERCENTILE))
+    calibration = config.get("calibration", "all")
+
+    scale_count = 0
+    if precision == "int8":
+        quantized_weights = [
+            quantize_tensor(
+                tensor, DEFAULT_BITS, granularity, symmetric, clip, percentile
+            )
+            for tensor in tensors
+        ]
+        weight_after = [dequantize(item) for item in quantized_weights]
+        scale_count = sum(item.scale_count for item in quantized_weights)
+    elif precision == "fp16":
+        weight_after = [to_fp16(tensor) for tensor in tensors]
+    else:
+        weight_after = list(tensors)
+
+    activations = as_tensor("activations", all_values)
+    if precision == "int8":
+        activation_range = _range_of(
+            calibration_values, clip, percentile, DEFAULT_BITS
+        )
+        quantized_activations = quantize_tensor(
+            activations,
+            DEFAULT_BITS,
+            "per_tensor",
+            False,
+            clip,
+            percentile,
+            given_range=activation_range,
+        )
+        activation_after = dequantize(quantized_activations)
+        clipped_fraction = quantized_activations.clipped_fraction
+        rlo, rhi = activation_range
+    else:
+        rlo, rhi = min(activations.data), max(activations.data)
+        activation_after = to_fp16(activations) if precision == "fp16" else activations
+        clipped_fraction = 0.0
+
+    return {
+        "model": str(model_name),
+        "label": str(label),
+        "precision": precision,
+        "granularity": granularity if precision == "int8" else "n/a",
+        "symmetric": symmetric if precision == "int8" else None,
+        "calibration": calibration if precision == "int8" else "not calibrated",
+        "clip": clip if precision == "int8" else "n/a",
+        "parameters": total_parameters(tensors),
+        "weight_error": quantization_error(tensors, weight_after)["relative"],
+        "activation_error": quantization_error(
+            [activations], [activation_after]
+        )["relative"],
+        "clipped_fraction": clipped_fraction,
+        "activation_range": [round(float(rlo), 8), round(float(rhi), 8)],
+        "scale_count": scale_count,
+        "bytes_stored": bytes_stored(tensors, precision, granularity),
+        "effective_bits": effective_bits(tensors, precision, granularity),
+    }
 
 
 def pareto_front(points: Sequence[Mapping[str, Any]],
                  objectives: Mapping[str, float]) -> tuple[int, ...]:
-    pass
+    candidates = list(points)
+    if not candidates or not objectives:
+        raise TensorError
+
+    objective_names = tuple(objectives)
+    for index, point in enumerate(candidates):
+        missing = [name for name in objective_names if name not in point]
+        if missing:
+            raise TensorError
+
+    front: list[int] = []
+    for index, candidate in enumerate(candidates):
+        beaten = False
+        for other_index, other in enumerate(candidates):
+            if index == other_index:
+                continue
+
+            better = False
+            worse = False
+            for name, sense in objectives.items():
+                difference = (
+                    float(other[name]) - float(candidate[name])
+                ) * float(sense)
+                if difference > 0.0:
+                    better = True
+                elif difference < 0.0:
+                    worse = True
+
+            if better and not worse:
+                beaten = True
+                break
+
+        if not beaten:
+            front.append(index)
+
+    return tuple(front)
 
 
 if __name__ == "__main__":
