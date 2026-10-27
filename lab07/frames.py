@@ -114,37 +114,92 @@ def grab_frame(pipeline: str, warmup_frames: int = 15) -> np.ndarray:
 ############################
 
 def frame_bytes(width: int, height: int, fmt: str) -> int:
-    pass
-
+    if (not isinstance(width, int) or isinstance(width, bool) or width <= 0
+            or not isinstance(height, int) or isinstance(height, bool) or height <= 0):
+        raise FrameError("Height and Width must be positive integers")
+    fmt = fmt.lower()
+    if fmt not in FORMATS:
+        raise FrameError(f"Format {fmt} is not supported.")
+    raw_bytes = width * height * _bytes_per_pixel(fmt)
+    return int(np.ceil(raw_bytes))
 
 def bytes_per_second(width: int, height: int, fmt: str, fps: float) -> float:
-    pass
+    if fps <= 0:
+        raise FrameError("FPS must be a positive number")
+    sf_byte = frame_bytes(width, height, fmt)
+    bw = sf_byte * fps
+    return float(bw)
 
 
 def frame_stats(pixels: Sequence[float] | Iterable[float]) -> dict[str, float]:
-    pass
+    pixels = [float(value) for value in pixels]
+    if not pixels:
+        raise FrameError("Pixel sequence is empty.")
+    vmin = float(np.min(pixels))
+    vmax = float(np.max(pixels))
+    N = len(pixels)
+    mean = 1/N * sum(pixels)
+    std = float(np.sqrt(1/N * sum((value - mean) ** 2 for value in pixels)))
+    return {
+        "min": vmin,
+        "max": vmax,
+        "mean": mean,
+        "spread": vmax - vmin,
+        "sd": std,
+        "samples": N,
+    }
 
 
 def classify(stats: dict[str, float]) -> tuple[str, str]:
-    pass
+    if not all(key in stats for key in ("max", "spread", "mean")):
+        raise FrameError("Stats dictionary must contain 'max', 'mean', and 'spread' keys.")
+    elif stats["max"] <= BLACK_MAX:
+        return "black", "The sensor is registering zero photon response"
+    elif stats["spread"] < FLAT_SPREAD:
+        return "flat", "Contrast is absent across all pixels"
+    elif stats["mean"] < 0.10:
+        return "dark", "Structure exists, but exposure is insufficient"
+    else:
+        return "scene", "The image possesses proper exposure and dynamic range."
 
 
 def conversion_bytes(width: int, height: int, src: str, dst: str) -> int:
-    pass
+    if src.lower() == dst.lower():
+        return 0
+    rv = frame_bytes(width, height, src)
+    rw = frame_bytes(width, height, dst)
+    return int(rv + rw)
 
 
 def resize_bytes(src_w: int, src_h: int, dst_w: int, dst_h: int,
                  fmt: str) -> int:
-    pass
+    return frame_bytes(src_w, src_h, fmt) + frame_bytes(dst_w, dst_h, fmt)
 
 
 def normalise_bytes(width: int, height: int, channels: int = 3,
                     out_bytes: int = 4) -> int:
-    pass
+    if width <= 0 or height <= 0 or channels <= 0:
+        raise FrameError("Channels, Width, and Height must be positive integers")
+    P = width * height * channels
+    return (P*1) + (P*out_bytes)
 
 
 def summarise_formats(width: int, height: int) -> list[dict[str, Any]]:
-    pass
+    base = frame_bytes(width, height, "rgb")
+    a_dict = []
+    for fmt in FORMATS:
+        N = frame_bytes(width, height, fmt)
+        bpp = _bytes_per_pixel(fmt)
+        ratio = N/base
+        format_note = FORMAT_NOTES[fmt]
+        a_dict.append({
+            "format": fmt,
+            "bytes_per_pixel": bpp,
+            "bytes": N,
+            "relative_to_rgb": ratio,
+            "note": format_note,
+        })
+    return a_dict
 
 
 ###############################
