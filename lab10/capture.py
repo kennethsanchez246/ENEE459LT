@@ -117,41 +117,130 @@ def wav_bytes(
     seconds: float,
     header_bytes: int = WAV_HEADER_BYTES,
 ) -> dict[str, Any]:
-    pass
+    ba = block_align(channels, bit_depth)
+    _positive_int(sample_rate, "sample_rate")
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        raise CaptureError(f"seconds is {seconds!r}, which is not a duration.")
+    if float(seconds) < 0.0:
+        raise CaptureError(f"seconds is {seconds}, which is not a duration.")
+    if isinstance(header_bytes, bool) or not isinstance(header_bytes, int) or header_bytes < 0:
+        raise CaptureError(f"header_bytes is {header_bytes!r}.")
+    discrete_samples = int(round(float(seconds) * sample_rate))
+    payload_bytes = discrete_samples * ba
+    return {
+        "samples": discrete_samples,
+        "block_align": ba,
+        "byte_rate": sample_rate * ba,
+        "data_bytes": payload_bytes,
+        "header_bytes": header_bytes,
+        "total_bytes": header_bytes + payload_bytes
+    }
 
 
 def duration_from_bytes(
     data_bytes: int, sample_rate: int, channels: int, bit_depth: int
 ) -> dict[str, Any]:
-    pass
+    ba = block_align(channels, bit_depth)
+    _positive_int(sample_rate, "sample_rate")
+    if isinstance(data_bytes, bool) or not isinstance(data_bytes, int) or data_bytes < 0:
+        raise CaptureError(f"data_bytes is {data_bytes!r}, which is not a byte count.")
+    samples, remainder = divmod(data_bytes, ba)
+    return {
+        "samples": samples,
+        "seconds": samples/sample_rate,
+        "remainder": remainder,
+        "whole": remainder == 0
+    }
 
 
 def header_consistency(
     header: dict[str, Any], audio: dict[str, Any]
 ) -> dict[str, Any]:
-    pass
+    if not isinstance(header, dict) or not isinstance(audio, dict):
+        raise CaptureError("header and audio must both be objects.")
+    mismatches = []
+    for field in CHOICES_IN_HEADER:
+        if field not in header or field not in audio:
+            raise CaptureError(f"{field!r} is missing from the header or the audio block; nothing can be compared.")
+        if header[field] != audio[field]:
+            mismatches.append({"field": field, "header": header[field], "audio": audio[field]})
+    if "data_bytes" not in header:
+        raise CaptureError("the header has no ’data_bytes’.")
+    dur = duration_from_bytes(header["data_bytes"], header["sample_rate"], header["channels"], header["bit_depth"])
+    return {
+        "agree" : not mismatches,
+        "mismatches" : mismatches,
+        "duration" : dur,
+        "stated_seconds" : float(audio.get("seconds", 0.0)),
+    }
 
 def dbfs(amplitude: float) -> float | None:
-    pass
+    if isinstance(amplitude, bool) or not isinstance(amplitude, (int, float)):
+        raise CaptureError(f"amplitude is {amplitude!r}, which is not a number.")
+    a = float(amplitude)
+    if a < 0.0:
+        raise CaptureError(f"amplitude is {a}. Levels here are magnitudes in [0, 1]; a negative one is a raw sample, and the sign of a raw sample says nothing about how loud it is.")
+    if a == 0.0:
+        return None
+    return 20.0 * math.log10(a)
 
 
 def bits_in_use(peak_dbfs: float | None, bit_depth: int) -> float:
     _positive_int(bit_depth, "bit_depth")
-    pass
+    if peak_dbfs is None:
+        return 0.0
+    if isinstance(peak_dbfs, bool) or not isinstance(peak_dbfs, (int, float)):
+        raise CaptureError(f"peak_dbfs is {peak_dbfs!r}, which is not a level.")
+    return max(0.0, bit_depth + float(peak_dbfs) / DB_PER_BIT)
 
 
 def level_sentence(level: dict[str, Any]) -> str:
-    pass
+    if level["silent"]:
+        return f"the capture is digitally silent: all {level['samples']} samples are zero"
+    p = level["peak_dbfs"]
+    parts = [f"peak {p:.2f} dBFS"]
+    if level["rms_dbfs"] is not None:
+        parts.append(f"RMS {level['rms_dbfs']:.2f} dBFS")
+    if level["crest_db"] is not None:
+        parts.append(f"crest {level['crest_db']:.2f} dB")
+    if level["clipped"] > 0:
+        parts.append(f"{level['clipped']} samples at the rail ({100.0 * level['clip_rate']:.4f}%)")
+    return ", ".join(parts)
 
 
 def record_gaps(record: dict[str, Any]) -> dict[str, Any]:
-    pass
-
+    if not isinstance(record, dict):
+        raise CaptureError(f"the record is a {type(record).__name__}, not an object.")
+    present = []
+    missing = []
+    blank = []
+    for key in THIRTEEN_CHOICES:
+        if key not in record:
+            missing.append(key)
+        elif not str(record[key]).strip():
+            blank.append(key)
+        else:
+            present.append(key)
+    return {
+        "present": present,
+        "missing": missing,
+        "blank": blank,
+        "complete": not missing and not blank,
+        "in_header": list(CHOICES_IN_HEADER),
+        "hand_written": list(key for key in THIRTEEN_CHOICES if key not in CHOICES_IN_HEADER)
+    }
 
 def record_sentence(gaps: dict[str, Any]) -> str:
-    pass
-
-
+    n = len(gaps["present"])
+    total = n + len(gaps["missing"]) + len(gaps["blank"])
+    if gaps["complete"]:
+        return f"all {total} choices are named, {len(gaps['in_header'])} of them also in the file header and {len(gaps['hand_written'])} of them nowhere else"
+    parts = []
+    if gaps["missing"]:
+        parts.append(f"{len(gaps['missing'])} missing ({', '.join(gaps['missing'])})")
+    if gaps["blank"]:
+        parts.append(f"{len(gaps['blank'])} present and empty ({', '.join(gaps['blank'])})")
+    return f"{n} of {total} choices are named; " + "; ".join(parts)
 # =====================================================================
 # Reading the WAV file & Running the analysis
 # =====================================================================
@@ -311,13 +400,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run Stages A, B, and E analysis on a .wav file and export to JSON."
     )
-    parser.add_argument("wav_path", type=str, help="Path to input .wav file")
+    parser.add_argument(
+        "wav_path",
+        nargs="?",
+        default=str(Path(__file__).with_name("test_voice.wav")),
+        help="Path to input .wav file (default: bundled test_voice.wav)",
+    )
     parser.add_argument(
         "-o",
         "--output",
         type=str,
         default=None,
-        help="Path for output JSON file (default: <wav_filename>_report.json)",
+        help="Path for output JSON file (default: <wav_filename>_generated_report.json)",
     )
     args = parser.parse_args()
 
@@ -328,7 +422,7 @@ def main() -> None:
     output_file = (
         Path(args.output)
         if args.output
-        else input_file.with_name(f"{input_file.stem}_report.json")
+        else input_file.with_name(f"{input_file.stem}_generated_report.json")
     )
 
     results = run_analysis(input_file)
@@ -339,7 +433,8 @@ def main() -> None:
     print(f"Results written to: {output_file}")
     print(f"Sentence: {results['verdicts']['level_sentence']}")
     print(
-        f"Bits in use: {results['resolution']['bits_in_use']} of {results['wav_structure']['block_align'] * 8 // results['wav_structure']['block_align']} bits"
+        f"Bits in use: {results['resolution']['bits_in_use']} of "
+        f"{results['resolution']['full_scale_range_db'] / DB_PER_BIT:g} bits"
     )
 
 
